@@ -7,7 +7,7 @@ Windows Registry Editor Version 5.00
 "Position"="Top"
 
 [HKEY_CLASSES_ROOT\DesktopBackground\Shell\NotszTweaksPlaceholder\command]
-@="mshta vbscript:msgbox(\"ola <3\",64,\"Notsz Tweaks\")(window.close)"
+@=powershell -WindowStyle Hidden -Command "Add-Type -AssemblyName PresentationFramework;[System.Windows.MessageBox]::Show('ola <3','Notsz Tweaks')"
 
 ; ---------- "Limpar RAM (Notsz)" - roda o clean-ram.ps1 via launcher ----------
 [HKEY_CLASSES_ROOT\DesktopBackground\Shell\NotszCleanRAM]
