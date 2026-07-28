@@ -1,88 +1,102 @@
+#requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Limpa a RAM:
-    1) Working sets de todos os processos
-    2) Modified List (paginas sujas a espera de ir para o disco)
-    3) Standby List (o "Cached" que aparece no Task Manager)
-    4) Low-Priority Standby List (subset da Standby, limpa primeiro)
-    5) File System Cache (RAM usada para cache de ficheiros do disco)
-.NOTES
-    Precisa de Administrador para os passos 2-5.
+    Notsz - Limpeza completa de RAM
+    Working Sets + Modified List + Standby List + File System Cache
 #>
- 
-Add-Type -Namespace Notsz -Name Mem -MemberDefinition @"
+
+Add-Type -AssemblyName PresentationFramework
+
+# Evitar erro "tipo ja existe" se correr multiplas vezes na mesma sessao
+try {
+Add-Type -Namespace NotszMem -Name RAM -MemberDefinition @"
 [DllImport("ntdll.dll")]
-public static extern int NtSetSystemInformation(int InfoClass, IntPtr Info, int Length);
- 
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern bool SetSystemFileCacheSize(IntPtr MinimumFileCacheSize, IntPtr MaximumFileCacheSize, uint Flags);
- 
+public static extern uint NtSetSystemInformation(int cls, IntPtr buf, int len);
+
 [DllImport("advapi32.dll", SetLastError=true)]
-public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
- 
+public static extern bool OpenProcessToken(IntPtr proc, uint access, out IntPtr token);
+
 [DllImport("advapi32.dll", SetLastError=true)]
-public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
- 
+public static extern bool LookupPrivilegeValue(string sys, string name, out long luid);
+
 [DllImport("advapi32.dll", SetLastError=true)]
-public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
- 
+public static extern bool AdjustTokenPrivileges(IntPtr token, bool disable, ref TP tp, uint len, IntPtr prev, IntPtr ret);
+
 [DllImport("kernel32.dll")]
 public static extern IntPtr GetCurrentProcess();
- 
+
+[StructLayout(LayoutKind.Sequential, Pack=4)]
+public struct TP { public uint Count; public long Luid; public uint Attribs; }
+
 [StructLayout(LayoutKind.Sequential)]
-public struct TOKEN_PRIVILEGES {
-    public uint PrivilegeCount;
-    public long Luid;
-    public uint Attributes;
+public struct FILECACHE {
+    public IntPtr CurrentSize;
+    public IntPtr PeakSize;
+    public uint PageFaultCount;
+    public IntPtr MinimumWorkingSet;
+    public IntPtr MaximumWorkingSet;
+    public IntPtr CurrentSizeIncludingTransitionInPages;
+    public IntPtr PeakSizeIncludingTransitionInPages;
+    public uint TransitionRePurposeCount;
+    public uint Flags;
 }
 "@
- 
+} catch {}
+
 function Enable-Priv([string]$name) {
-    $hTok = [IntPtr]::Zero
-    if (-not [Notsz.Mem]::OpenProcessToken([Notsz.Mem]::GetCurrentProcess(), 0x28, [ref]$hTok)) { return }
-    $luid = 0
-    if (-not [Notsz.Mem]::LookupPrivilegeValue($null, $name, [ref]$luid)) { return }
-    $tp = New-Object Notsz.Mem+TOKEN_PRIVILEGES
-    $tp.PrivilegeCount = 1
-    $tp.Luid = $luid
-    $tp.Attributes = 0x2
-    [Notsz.Mem]::AdjustTokenPrivileges($hTok, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $tok = [IntPtr]::Zero
+    [NotszMem.RAM]::OpenProcessToken([NotszMem.RAM]::GetCurrentProcess(), 0x28, [ref]$tok) | Out-Null
+    $luid = 0L
+    [NotszMem.RAM]::LookupPrivilegeValue($null, $name, [ref]$luid) | Out-Null
+    $tp = New-Object NotszMem.RAM+TP
+    $tp.Count = 1; $tp.Luid = $luid; $tp.Attribs = 2
+    [NotszMem.RAM]::AdjustTokenPrivileges($tok, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
 }
- 
+
+# RAM livre antes
+$antes = [Math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024)
+
 # Ativar privilegios necessarios
 Enable-Priv "SeProfileSingleProcessPrivilege"
 Enable-Priv "SeIncreaseQuotaPrivilege"
- 
-# --- 1) Trim working set de cada processo ---
+
+# 1) Trim working sets de todos os processos
 Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
     try { $_.MinWorkingSet = $_.MinWorkingSet } catch {}
 }
- 
-# --- 2-5) Limpar listas de memoria do sistema ---
-# SystemMemoryListInformation = 80
-# 2 = MemoryEmptyWorkingSets      (working sets do sistema)
-# 3 = MemoryFlushModifiedList     (paginas sujas -> disco)
-# 4 = MemoryPurgeStandbyList      (standby list completa = "Cached" no Task Manager)
-# 5 = MemoryPurgeLowPriorityStandbyList (subset de baixa prioridade da standby)
+
+# 2-5) SystemMemoryListInformation (class 80)
+#   2 = MemoryEmptyWorkingSets          (working sets do sistema)
+#   3 = MemoryFlushModifiedList         (paginas sujas -> escreve no disco)
+#   4 = MemoryPurgeStandbyList          (Standby = "Cached" no Task Manager)
+#   5 = MemoryPurgeLowPriorityStandbyList
 foreach ($cmd in 2, 3, 4, 5) {
     $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
     [Runtime.InteropServices.Marshal]::WriteInt32($ptr, $cmd)
-    [Notsz.Mem]::NtSetSystemInformation(80, $ptr, 4) | Out-Null
+    [NotszMem.RAM]::NtSetSystemInformation(80, $ptr, 4) | Out-Null
     [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
 }
- 
-# --- 6) File System Cache ---
-# RAM que o Windows usa para guardar ficheiros lidos do disco (diferente da Standby List).
-# Passar -1 em ambos os tamanhos forca o Windows a redefinir e libertar a cache.
-# Requer SeIncreaseQuotaPrivilege (ja ativado acima).
-[Notsz.Mem]::SetSystemFileCacheSize([IntPtr](-1), [IntPtr](-1), 0) | Out-Null
- 
-# --- Notificacao ---
-Add-Type -AssemblyName PresentationFramework
+
+# 6) File System Cache - SystemFileCacheInformation (class 81)
+#    Passar -1 em MinimumWorkingSet e MaximumWorkingSet forca o Windows
+#    a libertar a cache de ficheiros lidos do disco (System Working Set)
+$fc = New-Object NotszMem.RAM+FILECACHE
+$fc.MinimumWorkingSet = [IntPtr]::new(-1)
+$fc.MaximumWorkingSet = [IntPtr]::new(-1)
+$fcSize = [Runtime.InteropServices.Marshal]::SizeOf($fc)
+$fcPtr  = [Runtime.InteropServices.Marshal]::AllocHGlobal($fcSize)
+[Runtime.InteropServices.Marshal]::StructureToPtr($fc, $fcPtr, $false)
+[NotszMem.RAM]::NtSetSystemInformation(81, $fcPtr, $fcSize) | Out-Null
+[Runtime.InteropServices.Marshal]::FreeHGlobal($fcPtr)
+
+# Dar tempo ao OS para atualizar os contadores
+Start-Sleep -Milliseconds 500
+
+# RAM livre depois
+$depois    = [Math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024)
+$libertada = $depois - $antes
+
 [System.Windows.MessageBox]::Show(
-    "RAM limpa com sucesso!`n`n- Working Sets`n- Modified List`n- Standby List`n- Low-Priority Standby`n- File System Cache",
-    "Notsz Tweaks",
-    "OK",
-    "Information"
+    "RAM limpa!`n`n  Antes:       $antes MB livres`n  Depois:      $depois MB livres`n  Libertada: +$libertada MB",
+    "Notsz Tweaks", "OK", "Information"
 ) | Out-Null
- 
